@@ -88,12 +88,16 @@ func (p PostgresStore) GetLastUpdatedDate(projectName string) (time.Time, error)
 	return lastUpdated, nil
 }
 
-func (p PostgresStore) UpdateProjectCache(projectID int, projectName string, mrs []model.MergeRequest) error {
+func (p PostgresStore) UpdateProjectCache(projectID int, projectName string, mrs []model.MergeRequest) (retErr error) {
 	tx, err := p.db.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			retErr = errors.Join(retErr, fmt.Errorf("failed to roll back transaction: %w", rollbackErr))
+		}
+	}()
 
 	_, err = tx.Exec(`
 		INSERT INTO projects(project_id, project_name, last_updated) 
@@ -115,12 +119,16 @@ func (p PostgresStore) UpdateProjectCache(projectID int, projectName string, mrs
 	return tx.Commit()
 }
 
-func (p PostgresStore) GetAggregatedDataForDate(projectNames []string, targetDate time.Time) (*model.AggregatedStats, error) {
+func (p PostgresStore) GetAggregatedDataForDate(projectNames []string, targetDate time.Time) (stats *model.AggregatedStats, retErr error) {
 	rows, err := p.db.Query(getAggregatedDataSQL(), pq.Array(projectNames), targetDate)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute query: %w", err)
 	}
-	defer rows.Close()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("failed to close rows: %w", closeErr))
+		}
+	}()
 
 	devTotals := make(map[string]int)
 	repoTotals := make(map[string]int)
