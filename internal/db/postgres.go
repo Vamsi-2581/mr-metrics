@@ -88,91 +88,94 @@ func (p PostgresStore) GetLastUpdatedDate(projectName string) (time.Time, error)
 	return lastUpdated, nil
 }
 
-func (p PostgresStore) UpdateProjectCache(projectID int, projectName string, mrs []model.MergeRequest) (retErr error) {
+func (p PostgresStore) UpdateProjectCache(projectID int, projectName string, mrs []model.MergeRequest) error {
 	tx, err := p.db.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer func() {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
-			retErr = errors.Join(retErr, fmt.Errorf("failed to roll back transaction: %w", rollbackErr))
+
+	err = func() error {
+		_, err := tx.Exec(`
+			INSERT INTO projects(project_id, project_name, last_updated) 
+			VALUES($1, $2, NOW())
+			ON CONFLICT(project_id) DO UPDATE SET 
+				project_name = EXCLUDED.project_name,
+				last_updated = NOW()
+		`, projectID, projectName)
+		if err != nil {
+			return fmt.Errorf("failed to update project: %w", err)
 		}
+
+		userDates := groupMRsByUserAndDate(mrs)
+		if err := updateDailyCumulativeCounts(tx, userDates, projectID); err != nil {
+			return fmt.Errorf("failed to update daily cumulative counts: %w", err)
+		}
+
+		return tx.Commit()
 	}()
 
-	_, err = tx.Exec(`
-		INSERT INTO projects(project_id, project_name, last_updated) 
-		VALUES($1, $2, NOW())
-		ON CONFLICT(project_id) DO UPDATE SET 
-			project_name = EXCLUDED.project_name,
-			last_updated = NOW()
-	`, projectID, projectName)
-	if err != nil {
-		return fmt.Errorf("failed to update project: %w", err)
+	if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+		err = errors.Join(err, fmt.Errorf("failed to roll back transaction: %w", rollbackErr))
 	}
-
-	userDates := groupMRsByUserAndDate(mrs)
-
-	if err := updateDailyCumulativeCounts(tx, userDates, projectID); err != nil {
-		return fmt.Errorf("failed to update daily cumulative counts: %w", err)
-	}
-
-	return tx.Commit()
+	return err
 }
 
-func (p PostgresStore) GetAggregatedDataForDate(projectNames []string, targetDate time.Time) (stats *model.AggregatedStats, retErr error) {
+func (p PostgresStore) GetAggregatedDataForDate(projectNames []string, targetDate time.Time) (*model.AggregatedStats, error) {
 	rows, err := p.db.Query(getAggregatedDataSQL(), pq.Array(projectNames), targetDate)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute query: %w", err)
 	}
-	defer func() {
-		if closeErr := rows.Close(); closeErr != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("failed to close rows: %w", closeErr))
-		}
-	}()
 
-	devTotals := make(map[string]int)
-	repoTotals := make(map[string]int)
-	projectsSet := make(map[string]struct{})
-	developerStats := make(map[string]map[string]int)
+	stats, queryErr := func() (*model.AggregatedStats, error) {
+		devTotals := make(map[string]int)
+		repoTotals := make(map[string]int)
+		projectsSet := make(map[string]struct{})
+		developerStats := make(map[string]map[string]int)
 
-	for rows.Next() {
-		var devTotal int
-		var count int
-		var username, fullProjectName string
+		for rows.Next() {
+			var devTotal int
+			var count int
+			var username, fullProjectName string
 
-		if err := rows.Scan(&username, &fullProjectName, &count, &devTotal); err != nil {
-			return nil, fmt.Errorf("failed to scan row: %w", err)
-		}
-
-		projectName := extractProjectName(fullProjectName)
-		projectsSet[projectName] = struct{}{}
-
-		if username == "TOTAL" {
-			// Repository total merged mrs row
-			repoTotals[projectName] = count
-		} else {
-			if _, exists := developerStats[username]; !exists {
-				developerStats[username] = make(map[string]int)
+			if err := rows.Scan(&username, &fullProjectName, &count, &devTotal); err != nil {
+				return nil, fmt.Errorf("failed to scan row: %w", err)
 			}
-			devTotals[username] = devTotal
-			developerStats[username][projectName] = count
+
+			projectName := extractProjectName(fullProjectName)
+			projectsSet[projectName] = struct{}{}
+
+			if username == "TOTAL" {
+				// Repository total merged mrs row
+				repoTotals[projectName] = count
+			} else {
+				if _, exists := developerStats[username]; !exists {
+					developerStats[username] = make(map[string]int)
+				}
+				devTotals[username] = devTotal
+				developerStats[username][projectName] = count
+			}
 		}
+
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("row iteration error: %w", err)
+		}
+
+		projects := sortedKeys(projectsSet)
+		return &model.AggregatedStats{
+			Developers: developerStats,
+			Projects:   projects,
+			DevTotals:  devTotals,
+			RepoTotals: repoTotals,
+		}, nil
+	}()
+	if closeErr := rows.Close(); closeErr != nil {
+		queryErr = errors.Join(queryErr, fmt.Errorf("failed to close rows: %w", closeErr))
 	}
-
-	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("row iteration error: %w", err)
+	if queryErr != nil {
+		return nil, queryErr
 	}
-
-	projects := sortedKeys(projectsSet)
-
-	return &model.AggregatedStats{
-		Developers: developerStats,
-		Projects:   projects,
-		DevTotals:  devTotals,
-		RepoTotals: repoTotals,
-	}, nil
+	return stats, nil
 }
-
 func extractProjectName(fullName string) string {
 	parts := strings.Split(fullName, "/")
 	if len(parts) > 1 {
