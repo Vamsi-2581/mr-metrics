@@ -176,6 +176,7 @@ func (p PostgresStore) GetAggregatedDataForDate(projectNames []string, targetDat
 	}
 	return stats, nil
 }
+
 func extractProjectName(fullName string) string {
 	parts := strings.Split(fullName, "/")
 	if len(parts) > 1 {
